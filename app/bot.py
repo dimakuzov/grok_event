@@ -10,16 +10,15 @@ from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     InputMediaPhoto,
     Message,
 )
 
 from app.config import ALBUM_WAIT_SEC, MAX_PHOTOS, MIN_PHOTOS, TELEGRAM_BOT_TOKEN, require_env
 from app.fal_media import animate_image, download, edit_image, upload
-from app.memory import Photo, get_session
-from app.xai_plan import analyze
+from app.memory import Photo, Session, get_session
+from app.styles import STYLES, platform_keyboard, prefs_keyboard, style_brief, style_keyboard
+from app.xai_plan import analyze, flag_outliers
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("grok_event")
@@ -27,17 +26,21 @@ log = logging.getLogger("grok_event")
 router = Router()
 
 HELP = (
-    "Пришли одним сообщением 1–5 фото и описание события в подписи "
+    "Пришли одним сообщением 1-5 фото и описание события в подписи "
     "(что за ивент и для кого).\n\n"
-    "Потом можно опционально прислать референс стиля — фото или текст — "
-    "или нажать «Пропустить».\n\n"
-    "/cancel — сбросить текущую задачу\n"
-    "/logs — последние логи для отладки"
+    "Сначала выбери площадку, потом стиль. После стиля можно одним сообщением уточнить вкус "
+    "(плёнка, надписи в видео, камера) или нажать «Без уточнений».\n\n"
+    "/cancel сбросить задачу\n"
+    "/logs логи для отладки"
 )
 
-SKIP_KB = InlineKeyboardMarkup(
-    inline_keyboard=[[InlineKeyboardButton(text="Пропустить", callback_data="skip_style")]]
+STYLE_PROMPT = "Какой вайб поста?"
+PLATFORM_PROMPT = "Куда постим?"
+PREFS_PROMPT = (
+    "Можно одним сообщением уточнить стиль: плёнка, надписи в кадре, камера, тон. "
+    "База стиля останется, твои правки важнее. Или нажми «Без уточнений»."
 )
+RETRY_PROMPT = "Готово. Можно другой стиль или новая пачка фото."
 
 
 def _file_of(message: Message) -> str | None:
@@ -51,6 +54,166 @@ async def _load_photo(bot: Bot, file_id: str) -> bytes:
     buf = BytesIO()
     await bot.download_file(tg_file.file_path, buf)
     return buf.getvalue()
+
+
+def _status_animate(text: str) -> bool:
+    first = text.split("\n", 1)[0]
+    return not first.startswith("Готово") and not first.startswith("Ошибка:")
+
+
+def _stop_status_anim(session: Session) -> None:
+    task = session.status_anim_task
+    session.status_anim_task = None
+    session.status_animate = False
+    if task and not task.done():
+        task.cancel()
+
+
+async def _status_anim_loop(bot: Bot, session: Session) -> None:
+    try:
+        while True:
+            await asyncio.sleep(1)
+            if not session.status_animate or not session.status_message_id or not session.status_base:
+                return
+            session.status_dots = (session.status_dots + 1) % 4
+            text = session.status_base + ("." * session.status_dots)
+            try:
+                await bot.edit_message_text(
+                    text,
+                    chat_id=session.status_chat_id,
+                    message_id=session.status_message_id,
+                )
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        return
+
+
+async def set_status(bot: Bot, session: Session, chat_id: int, text: str) -> None:
+    animate = _status_animate(text)
+    session.status_base = text.rstrip(".")
+    session.status_dots = 0
+    _stop_status_anim(session)
+    session.status_animate = animate
+    if session.status_message_id and session.status_chat_id == chat_id:
+        try:
+            await bot.edit_message_text(
+                session.status_base,
+                chat_id=chat_id,
+                message_id=session.status_message_id,
+            )
+            if animate:
+                session.status_anim_task = asyncio.create_task(_status_anim_loop(bot, session))
+            return
+        except Exception:
+            pass
+    msg = await bot.send_message(chat_id, session.status_base)
+    session.status_chat_id = chat_id
+    session.status_message_id = msg.message_id
+    if animate:
+        session.status_anim_task = asyncio.create_task(_status_anim_loop(bot, session))
+
+
+async def _ensure_uploads(bot: Bot, session: Session) -> None:
+    async with session.upload_lock:
+        if session.photo_urls and len(session.photo_urls) == len(session.photos):
+            return
+        session.log("download telegram files")
+        for photo in session.photos:
+            if not photo.data:
+                photo.data = await _load_photo(bot, photo.file_id)
+        session.log("upload to fal cdn")
+        session.photo_urls = list(
+            await asyncio.gather(
+                *[asyncio.to_thread(upload, p.data, f"event_{i}.jpg") for i, p in enumerate(session.photos)]
+            )
+        )
+
+
+async def clear_status(bot: Bot, session: Session) -> None:
+    _stop_status_anim(session)
+    if session.status_message_id and session.status_chat_id:
+        try:
+            await bot.delete_message(
+                chat_id=session.status_chat_id,
+                message_id=session.status_message_id,
+            )
+        except Exception:
+            pass
+    session.status_message_id = None
+
+
+async def _offer_platform(bot: Bot, chat_id: int, session: Session) -> None:
+    session.state = "waiting_platform"
+    await bot.send_message(chat_id, PLATFORM_PROMPT, reply_markup=platform_keyboard())
+
+
+async def _offer_styles(bot: Bot, chat_id: int, session: Session, text: str) -> None:
+    session.state = "waiting_style"
+    await bot.send_message(chat_id, text, reply_markup=style_keyboard(session.style_id or None))
+
+
+async def _background_clarify(bot: Bot, chat_id: int, user_id: int, pack_id: int) -> None:
+    session = get_session(user_id)
+    try:
+        await _ensure_uploads(bot, session)
+        session.log("outlier check start")
+        outliers = await asyncio.to_thread(flag_outliers, session.photo_urls, session.caption)
+        session.log(f"outlier check done: {len(outliers)}")
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        session.log(f"outlier check failed, skip: {exc}")
+        log.exception("outlier check failed")
+        return
+
+    session = get_session(user_id)
+    if session.pack_id != pack_id:
+        return
+    if not session.photos:
+        return
+    if not outliers:
+        return
+
+    item = outliers[0]
+    if not (0 <= item["index"] < len(session.photos)):
+        return
+    session.pending_outlier = item
+    session.skip_indices.add(item["index"])
+    session.log(f"outlier queued photo {item['index']}: {item.get('reason')}")
+
+
+async def _ask_outlier(bot: Bot, chat_id: int, session: Session) -> bool:
+    item = session.pending_outlier
+    if not item:
+        return False
+    idx = int(item["index"])
+    if not (0 <= idx < len(session.photos)):
+        session.pending_outlier = None
+        return False
+    session.pending_outlier = None
+    session.awaiting_clarify = True
+    session.state = "waiting_clarify"
+    questions = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(item["questions"]))
+    session.log(f"clarify photo {idx}: {item.get('reason')}")
+    await bot.send_photo(chat_id, session.photos[idx].file_id, caption=questions)
+    return True
+
+
+async def _start_job_or_clarify(bot: Bot, chat_id: int, user_id: int) -> None:
+    session = get_session(user_id)
+    task = session.clarify_task
+    if task and not task.done():
+        await set_status(bot, session, chat_id, "Ещё смотрю кадры")
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        await clear_status(bot, session)
+    session = get_session(user_id)
+    if await _ask_outlier(bot, chat_id, session):
+        return
+    await run_job(bot, chat_id, user_id)
 
 
 async def _finish_collect(bot: Bot, chat_id: int, user_id: int) -> None:
@@ -70,16 +233,12 @@ async def _finish_collect(bot: Bot, chat_id: int, user_id: int) -> None:
         await bot.send_message(chat_id, f"Нужно от {MIN_PHOTOS} до {MAX_PHOTOS} фото. Пришли пачку заново.")
         session.reset_job()
         return
-    n = len(session.photos)
-    session.state = "waiting_style"
-    session.log(f"pack ready: {n} photos, caption={session.caption[:120]!r}")
-    await bot.send_message(
-        chat_id,
-        f"Получил {n} фото и описание.\n"
-        "Референс стиля — по желанию: одно фото или короткий текст. "
-        "Или нажми «Пропустить».",
-        reply_markup=SKIP_KB,
-    )
+
+    session.pack_id += 1
+    pack_id = session.pack_id
+    session.log(f"pack ready: {len(session.photos)} photos")
+    await _offer_platform(bot, chat_id, session)
+    session.clarify_task = asyncio.create_task(_background_clarify(bot, chat_id, user_id, pack_id))
 
 
 @router.message(Command("start", "help"))
@@ -105,17 +264,60 @@ async def cmd_logs(message: Message) -> None:
     await message.answer(f"<pre>{html.escape(text)}</pre>", parse_mode="HTML")
 
 
-@router.callback_query(F.data == "skip_style")
-async def skip_style(query: CallbackQuery) -> None:
+@router.callback_query(F.data.startswith("platform:"))
+async def on_platform(query: CallbackQuery) -> None:
     session = get_session(query.from_user.id)
-    if session.state != "waiting_style":
-        await query.answer("Сейчас не жду референс")
+    if session.state not in {"waiting_platform", "waiting_style", "ready"}:
+        await query.answer("Сначала пришли фото с описанием")
+        return
+    key = query.data.split(":", 1)[1]
+    if key not in {"instagram", "linkedin"}:
+        await query.answer("Неизвестная площадка")
+        return
+    await query.answer()
+    session.platform = key
+    session.log(f"platform={key}")
+    await _offer_styles(query.bot, query.message.chat.id, session, STYLE_PROMPT)
+
+
+@router.callback_query(F.data == "skip_prefs")
+async def skip_prefs(query: CallbackQuery) -> None:
+    session = get_session(query.from_user.id)
+    if session.state != "waiting_prefs":
+        await query.answer("Сейчас не жду уточнение")
         return
     await query.answer()
     session.style_text = ""
-    session.style_photo = None
-    await query.message.answer("Ок, без референса. Начинаю.")
-    await run_job(query.bot, query.message.chat.id, query.from_user.id)
+    await _start_job_or_clarify(query.bot, query.message.chat.id, query.from_user.id)
+
+
+@router.callback_query(F.data.startswith("style:"))
+async def on_style(query: CallbackQuery) -> None:
+    session = get_session(query.from_user.id)
+    if session.state not in {"waiting_style", "ready"}:
+        await query.answer("Сначала выбери площадку")
+        return
+    if not session.platform:
+        await query.answer()
+        await _offer_platform(query.bot, query.message.chat.id, session)
+        return
+    await query.answer()
+    key = query.data.split(":", 1)[1]
+    if key == "custom":
+        session.state = "waiting_custom"
+        await query.message.answer("Напиши свой стиль одним сообщением. И про текст, и про картинку.")
+        return
+    if key not in STYLES:
+        await query.message.answer("Неизвестный стиль")
+        return
+    session.style_id = key
+    session.style_text = ""
+    session.state = "waiting_prefs"
+    title = STYLES[key]["title"]
+    await query.message.answer(
+        f"Стиль: {title}\n{PREFS_PROMPT}",
+        reply_markup=prefs_keyboard(),
+    )
 
 
 @router.message(F.photo)
@@ -128,16 +330,17 @@ async def on_photo(message: Message, bot: Bot) -> None:
     if session.state == "busy":
         await message.answer("Сейчас уже собираю контент. /cancel если надо оборвать.")
         return
-
-    if session.state == "waiting_style":
-        session.style_photo = Photo(file_id=file_id)
-        session.style_text = (message.caption or "").strip()
-        session.log("got style photo")
-        await message.answer("Референс принял. Начинаю.")
-        await run_job(bot, message.chat.id, message.from_user.id)
+    if session.state == "waiting_custom":
+        await message.answer("Для своего стиля пока хватит текста.")
+        return
+    if session.state == "waiting_prefs":
+        await message.answer("Уточнение стиля текстом, или кнопка «Без уточнений».")
+        return
+    if session.state == "waiting_clarify":
+        await message.answer("Ответь текстом про это фото.")
         return
 
-    if session.state == "idle":
+    if session.state != "collecting":
         session.reset_job()
         session.state = "collecting"
 
@@ -167,17 +370,50 @@ async def on_photo(message: Message, bot: Bot) -> None:
 @router.message(F.text)
 async def on_text(message: Message, bot: Bot) -> None:
     session = get_session(message.from_user.id)
+    if session.state == "waiting_clarify":
+        session.clarify = message.text.strip()
+        session.awaiting_clarify = False
+        lower = session.clarify.lower()
+        keep = any(w in lower for w in ("оставь", "используй", "это мо", "к ивенту", "талисман", "зовут"))
+        drop = any(w in lower for w in ("не использу", "не то", "случайно", "удали", "убер"))
+        if keep and not drop:
+            session.skip_indices.clear()
+            session.log("clarify: keep odd photo")
+            await message.answer("Ок, это фото оставлю.")
+        else:
+            session.log("clarify: drop odd photo")
+            await message.answer("Ок, это фото в пост не пойдёт.")
+        await run_job(bot, message.chat.id, message.from_user.id)
+        return
     if session.state == "busy":
         await message.answer("Уже работаю над задачей. /logs если нужно посмотреть ход.")
         return
-    if session.state == "waiting_style":
+    if session.state == "waiting_prefs":
         session.style_text = message.text.strip()
-        session.style_photo = None
-        session.log(f"got style text: {session.style_text[:120]!r}")
-        await message.answer("Стиль принял. Начинаю.")
-        await run_job(bot, message.chat.id, message.from_user.id)
+        session.log(f"style prefs: {session.style_text[:200]!r}")
+        await _start_job_or_clarify(bot, message.chat.id, message.from_user.id)
+        return
+    if session.state == "waiting_custom":
+        session.style_id = "custom"
+        session.style_text = message.text.strip()
+        await _start_job_or_clarify(bot, message.chat.id, message.from_user.id)
         return
     await message.answer(HELP)
+
+
+def _skip_edit_prompt(prompt: str) -> bool:
+    p = (prompt or "").lower()
+    markers = (
+        "do not use",
+        "don't use",
+        "accidental",
+        "exclude this",
+        "not part of the event",
+        "skip this photo",
+        "do not include",
+        "не использу",
+    )
+    return any(m in p for m in markers)
 
 
 async def run_job(bot: Bot, chat_id: int, user_id: int) -> None:
@@ -185,89 +421,99 @@ async def run_job(bot: Bot, chat_id: int, user_id: int) -> None:
     if session.state == "busy":
         return
     session.state = "busy"
+    _stop_status_anim(session)
+    session.status_message_id = None
     try:
-        session.log("download telegram files")
-        for photo in session.photos:
-            photo.data = await _load_photo(bot, photo.file_id)
-        style_bytes = None
-        if session.style_photo:
-            style_bytes = await _load_photo(bot, session.style_photo.file_id)
-
-        session.log("upload to fal cdn")
-        photo_urls = list(
-            await asyncio.gather(
-                *[asyncio.to_thread(upload, p.data, f"event_{i}.jpg") for i, p in enumerate(session.photos)]
-            )
-        )
-        style_url = await asyncio.to_thread(upload, style_bytes, "style.jpg") if style_bytes else None
-        session.log(f"cdn photos={len(photo_urls)} style={bool(style_url)}")
-
-        session.log("x.ai analyze + web search")
+        await set_status(bot, session, chat_id, "Анализирую задачу")
+        await _ensure_uploads(bot, session)
+        keep = [i for i in range(len(session.photo_urls)) if i not in session.skip_indices]
+        if not keep:
+            keep = list(range(len(session.photo_urls)))
+        urls = [session.photo_urls[i] for i in keep]
+        caption = session.caption
+        if session.clarify:
+            caption += f"\n\nUser note about an odd photo: {session.clarify}"
+        if session.skip_indices:
+            caption += "\nDo not mention excluded photos. They must not appear in the post."
+        brief = style_brief(session.style_id, session.style_text, session.platform)
+        session.log(f"x.ai analyze + web search, photos={keep} skip={sorted(session.skip_indices)} platform={session.platform}")
         plan = await asyncio.to_thread(
             analyze,
-            photo_urls,
-            session.caption,
-            session.style_text,
-            style_url,
-            len(photo_urls),
+            urls,
+            caption,
+            brief,
+            len(urls),
+            session.platform,
         )
         session.log(
             f"plan: {plan.get('summary')} platform={plan.get('platform')} "
             f"hero={plan.get('hero_index')} scores="
             f"{[round(p['animate_score'], 2) for p in plan['photos']]}"
         )
-        await bot.send_message(chat_id, "Задача проанализирована")
+        await set_status(bot, session, chat_id, "Контент создаётся")
 
-        await bot.send_message(chat_id, "Контент создаётся")
-        extra = [style_url] if style_url else []
-        aspect = plan["aspect_ratio"]
-
-        async def _edit_one(i: int, src: str) -> str:
+        async def _edit_one(i: int, src: str) -> str | None:
             prompt = plan["photos"][i]["edit_prompt"]
+            if _skip_edit_prompt(prompt):
+                session.log(f"image {i}: drop, prompt says not to use")
+                return None
             if not prompt:
                 session.log(f"image {i}: skip edit")
                 return src
             session.log(f"fal edit image {i}: {prompt[:180]}")
-            return await edit_image(src, prompt, aspect, extra, session.log)
+            try:
+                return await edit_image(src, prompt, plan["aspect_ratio"], [], session.log)
+            except Exception as exc:
+                if "no_media_generated" in str(exc):
+                    session.log(f"image {i}: fal refused, drop photo")
+                    return None
+                raise
 
-        image_urls = list(
-            await asyncio.gather(*[_edit_one(i, src) for i, src in enumerate(photo_urls)])
-        )
-        hero = image_urls[plan["hero_index"]]
-        session.log(f"fal video from edited hero {plan['hero_index']}: {plan.get('hero_reason')}")
+        edited = list(await asyncio.gather(*[_edit_one(i, src) for i, src in enumerate(urls)]))
+        pairs = [(i, url) for i, url in enumerate(edited) if url]
+        if not pairs:
+            raise RuntimeError("Не осталось фото после правок")
+        planned = plan["hero_index"]
+        hero = edited[planned] if 0 <= planned < len(edited) and edited[planned] else pairs[0][1]
+        still_urls = [url for _, url in pairs if url != hero]
+
+        await set_status(bot, session, chat_id, "Контент создаётся, видео в очереди Fal")
+        session.log(f"fal video from hero={planned}: {plan.get('hero_reason')}")
         video_url = await animate_image(hero, plan["video_prompt"], session.log)
         session.log("download outputs")
         video_bytes = await download(video_url)
-        image_blobs = [await download(u) for u in image_urls]
+        image_blobs = [await download(u) for u in still_urls]
 
-        caption = (plan.get("post_text") or "").strip()
+        post = (plan.get("post_text") or "").strip()
         await bot.send_video(
             chat_id,
             BufferedInputFile(video_bytes, filename="event.mp4"),
-            caption=caption[:1024] or None,
+            caption=post[:1024] or None,
         )
-        media = [
-            InputMediaPhoto(media=BufferedInputFile(blob, filename=f"event_{i}.jpg"))
-            for i, blob in enumerate(image_blobs)
-        ]
-        if len(media) == 1:
-            await bot.send_photo(chat_id, media[0].media)
-        else:
+        if len(image_blobs) == 1:
+            await bot.send_photo(chat_id, BufferedInputFile(image_blobs[0], filename="event_0.jpg"))
+        elif len(image_blobs) > 1:
+            media = [
+                InputMediaPhoto(media=BufferedInputFile(blob, filename=f"event_{i}.jpg"))
+                for i, blob in enumerate(image_blobs)
+            ]
             await bot.send_media_group(chat_id, media)
+        await set_status(bot, session, chat_id, "Готово")
         session.log("done")
-        await bot.send_message(chat_id, "Готово. Можно прислать следующую пачку.")
+        session.state = "ready"
+        await bot.send_message(
+            chat_id,
+            RETRY_PROMPT,
+            reply_markup=style_keyboard(session.style_id if session.style_id in STYLES else None),
+        )
     except Exception as exc:
         log.exception("job failed")
         session.log(f"ERROR: {exc}")
-        await bot.send_message(
-            chat_id,
-            f"Ошибка: {exc}\nМожно /logs или прислать пачку заново.",
-        )
+        await set_status(bot, session, chat_id, f"Ошибка: {exc}\nМожно /logs или /cancel")
+        session.state = "waiting_style" if session.photo_urls else "idle"
     finally:
-        logs_backup = session.logs
-        session.reset_job()
-        session.logs = logs_backup
-        session.state = "idle"
+        if session.state == "busy":
+            session.state = "ready"
 
 
 async def main() -> None:

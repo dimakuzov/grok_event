@@ -12,7 +12,7 @@ XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.6").strip()
 FAL_IMAGE_MODEL = os.getenv("FAL_IMAGE_MODEL", "fal-ai/nano-banana-2/edit").strip()
 FAL_VIDEO_MODEL = os.getenv(
     "FAL_VIDEO_MODEL",
-    "fal-ai/kling-video/v3/pro/image-to-video",
+    "minimax/h3-max-turbo/image-to-video",
 ).strip()
 
 MAX_PHOTOS = 5
