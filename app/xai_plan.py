@@ -15,7 +15,7 @@ CAPTION RULES (all styles, no exceptions):
 - NEVER use the em dash character or en dash. Use a period, comma, or a new sentence.
 - NEVER hyphenate words (forbidden: early-career, full-day, youth-business). Rephrase: early career, whole day.
 - Hyphens in URLs and hashtags like #GrokBot are ok.
-- No gratitude essays. If thanks fit, one short line like "спасибо, я был очень рад!" and stop.
+- No gratitude essays. If thanks fit, one short line like "thanks, I had a great time!" and stop.
 - If the style is youth / simple / modnik, use lowercase except proper names.
 - 2-5 short sentences max, then hashtags.
 """
@@ -229,8 +229,8 @@ def flag_outliers(photo_urls: list[str], caption: str) -> list[dict[str, Any]]:
     questions = questions[:3]
     if len(questions) < 2:
         questions = [
-            "Это как-то связано с ивентом?",
-            "Упоминать это в посте?",
+            "Is this related to the event?",
+            "Should we mention it in the post?",
         ]
     return [{"index": index, "reason": str(item.get("reason") or ""), "questions": questions}]
 

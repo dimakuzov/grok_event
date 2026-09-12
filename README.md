@@ -1,23 +1,22 @@
 # grok_event
 
-Telegram-бот: 1–5 фото с мероприятия + описание → пост (видео + обработанные кадры).
+Telegram bot: 1–5 event photos plus a caption → a post (one video + edited stills).
 
-1. Пользователь шлёт альбом (или одно фото) **с подписью**.
-2. Опционально — референс стиля (фото или текст) или «Пропустить».
-3. Если кадр явно не про ивент, Grok задаёт 2-3 вопроса с этим фото.
-4. Пользователь выбирает стиль кнопкой.
-5. **x.ai** собирает промпты. **Nano Banana 2** правит фото. **H3 Max Turbo** оживляет hero (камера как с телефона).
-6. В чат: 1 видео + остальные фото (hero не дублируется кадром). Потом можно другой стиль.
+1. The user sends an album (or one photo) **with a caption**.
+2. They pick a platform, then a style. After the style they can add one taste note (film, overlays, camera) or tap **No extra notes**.
+3. If a shot is clearly off-event, Grok asks 2–3 questions with that photo attached.
+4. **x.ai** writes the prompts. **Nano Banana 2** edits photos. **H3 Max Turbo** animates the hero (phone-camera motion).
+5. The chat gets 1 video + the remaining photos (the hero is not duplicated as a still). Then they can retry another style.
 
-## Запуск
+## Run
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# вписать TELEGRAM_BOT_TOKEN, XAI_API_KEY, FAL_KEY
+# fill in TELEGRAM_BOT_TOKEN, XAI_API_KEY, FAL_KEY
 python -m app
 ```
 
-Токен бота: [@BotFather](https://t.me/BotFather). Ключи: [console.x.ai](https://console.x.ai), [fal.ai/dashboard](https://fal.ai/dashboard).
+Bot token: [@BotFather](https://t.me/BotFather). Keys: [console.x.ai](https://console.x.ai), [fal.ai/dashboard](https://fal.ai/dashboard).

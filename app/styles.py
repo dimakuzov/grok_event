@@ -4,11 +4,11 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 STYLES = {
     "delo": {
-        "button": "Деловой",
-        "title": "Деловой (галстук в рюкзаке)",
+        "button": "Business",
+        "title": "Business (tie in the backpack)",
         "text": (
-            "Строго и коротко, как живой человек на конференции, не пресс-служба. "
-            "Где был, чем занимался, одна мысль. Без пафоса и без благодарственных од."
+            "Strict and short, like a real person at a conference, not a press office. "
+            "Where you were, what you did, one idea. No pomp, no gratitude essays."
         ),
         "image": (
             "Strict, clean conference still. Natural light, modest color, no gloss, no cinematic grade, "
@@ -21,11 +21,11 @@ STYLES = {
         ),
     },
     "startup": {
-        "button": "Стартап",
-        "title": "Стартап (питч в худи)",
+        "button": "Startup",
+        "title": "Startup (pitch in a hoodie)",
         "text": (
-            "Как сообщение в командный чат после демо дня: бодро, просто, без корпоратива. "
-            "Что собрали, с кем были, что зашло."
+            "Like a team-chat note after demo day: upbeat, simple, not corporate. "
+            "What you shipped, who you were with, what landed."
         ),
         "image": (
             "Startup energy, laptops, people. Phone snapshot grade. "
@@ -38,11 +38,11 @@ STYLES = {
         ),
     },
     "modnik": {
-        "button": "Модник",
-        "title": "Модник (street с бейджиком)",
+        "button": "Fashion",
+        "title": "Fashion (street with a badge)",
         "text": (
-            "Молодёжный и простой. Можно с маленькой буквы, кроме имён собственных. "
-            "Коротко про вайб места. Без эссе."
+            "Youthful and simple. Lowercase is fine except proper names. "
+            "Short on the vibe of the place. No essays."
         ),
         "image": (
             "Street style crop as for stories, fashion color, slightly more cinematic contrast and soft bloom. "
@@ -54,10 +54,10 @@ STYLES = {
         ),
     },
     "rock": {
-        "button": "Рок-звезда",
-        "title": "Рок-звезда (хедлайнер хакатона)",
+        "button": "Rock star",
+        "title": "Rock star (hackathon headliner)",
         "text": (
-            "Дерзко и коротко, как будто ты главный в кадре. Шутка уместна. Без длинных благодарностей."
+            "Bold and short, like you are the one in the frame. A joke is fine. No long thank-yous."
         ),
         "image": (
             "You as the main subject, bolder crop, punchier light. "
@@ -112,13 +112,13 @@ def style_keyboard(exclude: str | None = None) -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton(text="Указать свой стиль", callback_data="style:custom")])
+    rows.append([InlineKeyboardButton(text="Custom style", callback_data="style:custom")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def prefs_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="Без уточнений", callback_data="skip_prefs")]]
+        inline_keyboard=[[InlineKeyboardButton(text="No extra notes", callback_data="skip_prefs")]]
     )
 
 
